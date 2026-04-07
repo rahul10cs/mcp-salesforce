@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: salesforce-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: TRANSPORT
+        value: sse
+      - key: SF_USERNAME
+        sync: false        # fill this in Render dashboard
+      - key: SF_PASSWORD
+        sync: false        # fill this in Render dashboard
+      - key: SF_SECURITY_TOKEN
+        sync: false        # fill this in Render dashboard
+      - key: SF_DOMAIN
+        value: login       # change to "test" for sandbox
