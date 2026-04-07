@@ -8,11 +8,17 @@ Gives Claude (or any MCP client) the ability to query your Salesforce org:
   • get_cases          → list support cases with optional status filter
   • run_soql           → run any read-only SOQL query
   • get_org_info       → basic info about the connected Salesforce org
+
+Auth modes:
+  1. Per-user OAuth token  — passed via ?sf_token=&sf_instance= on the SSE URL (used by mcp-chat)
+  2. Client Credentials    — fallback using SF_CLIENT_ID / SF_CLIENT_SECRET env vars
 """
 
 import asyncio
 import os
 import re
+from contextvars import ContextVar
+from urllib.parse import parse_qs
 
 import requests
 import uvicorn
@@ -31,27 +37,50 @@ load_dotenv()
 
 server = Server("salesforce-mcp")
 
+# ---------------------------------------------------------------------------
+# Per-session credential store
+#
+# When mcp-chat connects via SSE it passes the user's SF access token as
+# query params: GET /sse?sf_token=<token>&sf_instance=<url>
+#
+# We capture the session_id assigned by the SSE transport and store the
+# token against it. When a tool call POST arrives (/messages/?session_id=<id>)
+# we look up the token and inject it into the async context so get_sf() can use it.
+# ---------------------------------------------------------------------------
+
+_session_creds: dict = {}                                       # { session_id: { token, instance_url } }
+_current_sf_creds: ContextVar = ContextVar("current_sf_creds", default=None)
+
 
 # ---------------------------------------------------------------------------
-# Salesforce connection — reads credentials from environment variables
+# Salesforce connection
 # ---------------------------------------------------------------------------
 
 def get_sf() -> Salesforce:
+    # Priority 1: per-user token injected via context (OAuth Authorization Code flow)
+    creds = _current_sf_creds.get()
+    if creds and creds.get("token"):
+        return Salesforce(
+            instance_url=creds["instance_url"],
+            session_id=creds["token"],
+        )
+
+    # Priority 2: Client Credentials flow (env vars — for CLI / direct use)
     client_id     = os.getenv("SF_CLIENT_ID")
     client_secret = os.getenv("SF_CLIENT_SECRET")
     instance_url  = os.getenv("SF_INSTANCE_URL")
 
     if not all([client_id, client_secret, instance_url]):
         raise ValueError(
-            "Missing Salesforce OAuth credentials. "
-            "Set SF_CLIENT_ID, SF_CLIENT_SECRET, SF_INSTANCE_URL in your .env file."
+            "No Salesforce credentials available. "
+            "Connect via the chat UI or set SF_CLIENT_ID, SF_CLIENT_SECRET, SF_INSTANCE_URL in .env."
         )
 
     resp = requests.post(
         f"{instance_url}/services/oauth2/token",
         data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
+            "grant_type":    "client_credentials",
+            "client_id":     client_id,
             "client_secret": client_secret,
         },
     )
@@ -231,16 +260,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = sf.query(query)
             return [types.TextContent(type="text", text=records_to_text(result["records"]))]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
     # ── get_contacts ─────────────────────────────────────────────────────────
     if name == "get_contacts":
         try:
-            sf     = get_sf()
-            limit  = min(int(arguments.get("limit", 10)), 50)
-            query  = "SELECT Id, FirstName, LastName, Email, Phone, Account.Name FROM Contact"
+            sf      = get_sf()
+            limit   = min(int(arguments.get("limit", 10)), 50)
+            query   = "SELECT Id, FirstName, LastName, Email, Phone, Account.Name FROM Contact"
             filters = []
             if arguments.get("email"):
                 filters.append(f"Email = '{safe_str(arguments['email'])}'")
@@ -252,7 +281,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = sf.query(query)
             return [types.TextContent(type="text", text=records_to_text(result["records"]))]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
@@ -268,7 +297,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = sf.query(query)
             return [types.TextContent(type="text", text=records_to_text(result["records"]))]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
@@ -284,7 +313,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = sf.query(query)
             return [types.TextContent(type="text", text=records_to_text(result["records"]))]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
@@ -292,14 +321,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "run_soql":
         try:
             query = arguments.get("query", "").strip()
-            # Only allow SELECT statements
             if not re.match(r"^\s*SELECT\b", query, re.IGNORECASE):
                 return [types.TextContent(type="text", text="Only SELECT queries are allowed.")]
             sf     = get_sf()
             result = sf.query(query)
             return [types.TextContent(type="text", text=records_to_text(result["records"]))]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
@@ -309,7 +337,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             sf     = get_sf()
             result = sf.query("SELECT Id, Name, OrganizationType, IsSandbox FROM Organization LIMIT 1")
             if result["records"]:
-                rec = result["records"][0]
+                rec  = result["records"][0]
                 info = (
                     f"Org Name    : {rec.get('Name')}\n"
                     f"Org ID      : {rec.get('Id')}\n"
@@ -320,7 +348,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 info = "Could not retrieve org info."
             return [types.TextContent(type="text", text=info)]
         except SalesforceAuthenticationFailed:
-            return [types.TextContent(type="text", text="Authentication failed. Check your Salesforce credentials.")]
+            return [types.TextContent(type="text", text="Salesforce authentication failed. Please reconnect via the chat UI.")]
         except Exception as e:
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
@@ -329,13 +357,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 # ---------------------------------------------------------------------------
 # Entry point — auto-selects transport based on TRANSPORT env var
-#
-#   TRANSPORT=stdio  (default) → for Claude Code local usage
-#   TRANSPORT=sse              → for Render / remote / Claude Web usage
 # ---------------------------------------------------------------------------
 
 async def run_stdio() -> None:
-    """Local mode — Claude Code connects via stdin/stdout."""
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream, write_stream, server.create_initialization_options()
@@ -343,21 +367,58 @@ async def run_stdio() -> None:
 
 
 def run_sse() -> None:
-    """Remote mode — any MCP client connects via HTTP + SSE."""
     sse_transport = SseServerTransport("/messages/")
 
     async def handle_sse(request: Request) -> None:
-        async with sse_transport.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await server.run(
-                streams[0], streams[1], server.create_initialization_options()
-            )
+        # Extract per-user SF token passed by mcp-chat as query params
+        sf_token    = request.query_params.get("sf_token")
+        sf_instance = request.query_params.get("sf_instance")
+
+        session_id_holder: dict = {}
+
+        # Intercept the SSE endpoint event to capture the session_id the transport assigns,
+        # so we can store the token against it and look it up on incoming POSTs.
+        original_send = request._send
+
+        async def capturing_send(message):
+            if message["type"] == "http.response.body" and "id" not in session_id_holder:
+                body = message.get("body", b"").decode("utf-8", errors="ignore")
+                m = re.search(r"session_id=([^\s\"&\n]+)", body)
+                if m and sf_token:
+                    sid = m.group(1)
+                    session_id_holder["id"] = sid
+                    _session_creds[sid] = {"token": sf_token, "instance_url": sf_instance}
+            await original_send(message)
+
+        try:
+            async with sse_transport.connect_sse(
+                request.scope, request.receive, capturing_send
+            ) as streams:
+                await server.run(
+                    streams[0], streams[1], server.create_initialization_options()
+                )
+        finally:
+            # Clean up session creds when connection closes
+            sid = session_id_holder.get("id")
+            if sid:
+                _session_creds.pop(sid, None)
+
+    async def handle_post_with_creds(scope, receive, send):
+        """Wrap handle_post_message to inject the right SF creds into async context."""
+        qs         = parse_qs(scope.get("query_string", b"").decode())
+        session_id = (qs.get("session_id") or [None])[0]
+        creds      = _session_creds.get(session_id) if session_id else None
+
+        token = _current_sf_creds.set(creds)
+        try:
+            await sse_transport.handle_post_message(scope, receive, send)
+        finally:
+            _current_sf_creds.reset(token)
 
     starlette_app = Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse_transport.handle_post_message),
+            Mount("/messages/", app=handle_post_with_creds),
         ]
     )
 
