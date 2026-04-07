@@ -218,16 +218,30 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="run_soql",
             description=(
-                "Run a custom read-only SOQL query against the Salesforce org. "
-                "Only SELECT statements are allowed. No INSERT, UPDATE, DELETE. "
-                "Example: SELECT Id, Name FROM Account WHERE Industry = 'Technology' LIMIT 5"
+                "Run a dynamic read-only SOQL query against the Salesforce org. "
+                "Use this tool to answer any question about Salesforce data by building the right query. "
+                "Only SELECT statements are allowed — no INSERT, UPDATE, or DELETE. "
+                "\n\nCommon objects and fields:"
+                "\n- Account: Id, Name, Industry, Phone, Website, AnnualRevenue, BillingCity, BillingCountry, Type"
+                "\n- Contact: Id, FirstName, LastName, Email, Phone, Title, Department, Account.Name"
+                "\n- Opportunity: Id, Name, StageName, Amount, CloseDate, Probability, Account.Name"
+                "\n- Case: Id, CaseNumber, Subject, Status, Priority, Origin, Account.Name"
+                "\n- Lead: Id, FirstName, LastName, Email, Company, Status, Industry, LeadSource"
+                "\n- Task: Id, Subject, Status, Priority, ActivityDate"
+                "\n- User: Id, Name, Email, Title, IsActive"
+                "\n\nDate literals: TODAY, YESTERDAY, THIS_WEEK, LAST_WEEK, THIS_MONTH, LAST_MONTH, THIS_YEAR, LAST_N_DAYS:n"
+                "\n\nExamples:"
+                "\n- SELECT Id, Name, AnnualRevenue FROM Account ORDER BY AnnualRevenue DESC LIMIT 5"
+                "\n- SELECT Id, CaseNumber, Subject, Status FROM Case WHERE Priority = 'High' AND Status != 'Closed'"
+                "\n- SELECT Id, Name, Amount, CloseDate FROM Opportunity WHERE CloseDate = THIS_MONTH ORDER BY Amount DESC"
+                "\n- SELECT Id, FirstName, LastName, Email FROM Contact WHERE Account.Name LIKE '%Acme%'"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "A valid SOQL SELECT query",
+                        "description": "A valid SOQL SELECT query built dynamically based on the user's request",
                     }
                 },
                 "required": ["query"],
