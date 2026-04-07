@@ -67,53 +67,163 @@ mcp-salesforce/
 
 ## Step-by-Step: What Happens When a Tool Is Called
 
-### Step 1 — MCP Client connects (`mcp-chat` or Claude Code)
+### Step 1 — MCP Client opens an SSE connection
+
 ```
 GET http://localhost:8000/sse
 ```
-The client opens a persistent SSE connection. The server sends a session ID back. All further communication happens through this channel.
 
-### Step 2 — Client lists available tools
-```python
-# mcp-chat/app.py calls:
-tools_response = await session.list_tools()
+The client (mcp-chat) makes an HTTP GET to `/sse`. The server keeps the connection open and immediately streams back a session endpoint via SSE:
+
 ```
-The server responds with the full list of tools (names, descriptions, input schemas). This is how Claude knows what it can call.
+event: endpoint
+data: /messages/?session_id=f4f4738fc2b54cda98cc14faf55cef37
+```
 
-### Step 3 — Claude decides to call a tool
-Claude receives the user's message and the tool list. If the query needs Salesforce data (e.g. "show me accounts"), Claude responds with a `tool_use` block:
+All further communication uses this session ID. The SSE connection stays alive for the duration of the request.
+
+This is handled in `server.py` by the Starlette route:
+
+```python
+starlette_app = Starlette(
+    routes=[
+        Route("/sse", endpoint=handle_sse),               # client connects here
+        Mount("/messages/", app=sse_transport.handle_post_message),  # client POSTs here
+    ]
+)
+```
+
+---
+
+### Step 2 — MCP Handshake (`initialize`)
+
+The client sends an `initialize` message to the session endpoint:
+
+```
+POST http://localhost:8000/messages/?session_id=<id>
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "method": "initialize",
+  "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+}
+```
+
+The server responds (via SSE stream) with its capabilities. After this, the session is active.
+
+---
+
+### Step 3 — Client lists available tools
+
+```
+POST http://localhost:8000/messages/?session_id=<id>
+
+{ "jsonrpc": "2.0", "method": "tools/list", "params": {} }
+```
+
+The server's `list_tools()` handler responds with all 6 tool definitions including their names, descriptions, and JSON schemas. The client (mcp-chat) converts these into the format Claude's API expects.
+
+```python
+@server.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="get_accounts",
+            description="Fetch accounts from Salesforce...",
+            inputSchema={ "type": "object", "properties": { "name_filter": ..., "limit": ... } }
+        ),
+        # ... 5 more tools
+    ]
+```
+
+---
+
+### Step 4 — Claude decides to call a tool
+
+Claude receives the user message and tool list from mcp-chat. For a query like "show me my accounts", Claude responds to the Anthropic API with `stop_reason = "tool_use"`:
+
 ```json
 {
   "type": "tool_use",
+  "id": "toolu_01ABC...",
   "name": "get_accounts",
   "input": { "limit": 10 }
 }
 ```
 
-### Step 4 — MCP Client sends tool call to this server
+---
+
+### Step 5 — MCP Client sends the tool call to this server
+
 ```
 POST http://localhost:8000/messages/?session_id=<id>
-```
-The client forwards the tool name and arguments to the MCP server.
 
-### Step 5 — `call_tool()` runs in `server.py`
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "get_accounts",
+    "arguments": { "limit": 10 }
+  }
+}
+```
+
+---
+
+### Step 6 — `call_tool()` runs in `server.py`
+
+The MCP SDK routes the call to the `call_tool` handler:
+
 ```python
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "get_accounts":
-        sf    = get_sf()          # authenticate to Salesforce
+        sf    = get_sf()          # ← OAuth token + simple_salesforce instance
         limit = min(int(arguments.get("limit", 10)), 50)
         query = "SELECT Id, Name, Industry, Phone, Website, AnnualRevenue FROM Account"
         if arguments.get("name_filter"):
             query += f" WHERE Name LIKE '%{safe_str(arguments['name_filter'])}%'"
         query += f" LIMIT {limit}"
-        result = sf.query(query)
+        result = sf.query(query)  # ← Salesforce REST API call
         return [types.TextContent(type="text", text=records_to_text(result["records"]))]
 ```
-The result is returned as plain text back through the SSE channel to the MCP client.
 
-### Step 6 — Result flows back to Claude, then to the user
-Claude receives the tool result, formats a natural-language response, and `mcp-chat` sends it back to the browser.
+`sf.query()` makes a `GET` request to Salesforce's REST API:
+
+```
+GET https://orgfarm-xxx.my.salesforce.com/services/data/v59.0/query
+    ?q=SELECT+Id,Name,Industry...+FROM+Account+LIMIT+10
+Authorization: Bearer 00DgK00000MqZJZ!...
+```
+
+Salesforce returns a JSON payload with a `records` array. `records_to_text()` formats it as a readable numbered list:
+
+```python
+def records_to_text(records: list, empty_msg: str = "No records found.") -> str:
+    if not records:
+        return empty_msg
+    lines = []
+    for i, rec in enumerate(records, 1):
+        clean = {k: v for k, v in rec.items() if k != "attributes"}  # strip SF metadata
+        lines.append(f"[{i}] " + " | ".join(f"{k}: {v}" for k, v in clean.items()))
+    return "\n".join(lines)
+```
+
+Output looks like:
+```
+[1] Id: 001... | Name: Edge Communications | Industry: Electronics | Phone: (512) 757-6000
+[2] Id: 001... | Name: Burlington Textiles | Industry: Apparel | Phone: (336) 222-7000
+...
+```
+
+This plain text is what gets sent back to Claude as the tool result.
+
+---
+
+### Step 7 — Result flows back to Claude, then to the user
+
+The tool result travels back through the SSE stream to mcp-chat, which appends it to the Claude conversation. Claude receives the Salesforce data and generates a formatted natural-language response, which mcp-chat returns to the browser.
 
 ---
 
@@ -139,7 +249,19 @@ def get_sf() -> Salesforce:
     )
 ```
 
-Every tool call triggers a fresh OAuth token request. The token is then passed directly to `simple_salesforce` as a session ID — no username or password needed.
+Every tool call triggers a fresh OAuth token request. Salesforce responds with:
+
+```json
+{
+  "access_token": "00DgK00000MqZJZ!AQEAQIF5qpaQ_XZ...",
+  "instance_url": "https://orgfarm-xxx.my.salesforce.com",
+  "token_type": "Bearer",
+  "scope": "api",
+  "issued_at": "1775545150722"
+}
+```
+
+The `access_token` is used as the session ID and the `instance_url` is used to construct all Salesforce REST API calls. No username or password is ever stored or transmitted.
 
 **Salesforce setup required:**
 1. Create a Connected App in Setup → App Manager
