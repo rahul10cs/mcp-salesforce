@@ -11,22 +11,28 @@ A **Model Context Protocol (MCP) server** that connects Claude (or any MCP-compa
 ## How It Fits Into the System
 
 ```
-User types in browser
-        │
-        ▼
-  [ mcp-chat ]  ← FastAPI app on port 3000
-  app.py acts as MCP Client
-        │  connects via SSE (HTTP + Server-Sent Events)
-        ▼
-  [ mcp-salesforce ]  ← THIS REPO — MCP Server on port 8000
-  server.py exposes Salesforce as tools
-        │  authenticates via OAuth Client Credentials Flow
-        ▼
-  [ Salesforce Org ]
+Browser (user)
+      │
+      │  1. Login with Salesforce (OAuth Authorization Code Flow)
+      ▼
+[ mcp-chat ]  ← FastAPI app on port 3000
+  - handles SF OAuth, session management, Anthropic key
+  - acts as MCP Client
+      │
+      │  2. GET /sse?sf_token=<user_token>&sf_instance=<org_url>
+      ▼
+[ mcp-salesforce ]  ← THIS REPO — MCP Server on port 8000
+  - receives user's SF token via URL params
+  - stores token per session
+  - injects token into get_sf() via async context var
+      │
+      │  3. REST API calls with Bearer <sf_token>
+      ▼
+[ Salesforce Org ]
   Returns live CRM data
 ```
 
-The MCP server's only job is to expose Salesforce data as a set of named tools. It does not talk to Claude directly — it waits for an MCP client (like `mcp-chat`) to connect, list its tools, and call them.
+The MCP server's only job is to expose Salesforce data as named tools. It does not talk to Claude directly — it waits for an MCP client to connect, list tools, and call them. The user's Salesforce access token is passed in on connection so each user's data is isolated.
 
 ---
 
@@ -227,48 +233,117 @@ The tool result travels back through the SSE stream to mcp-chat, which appends i
 
 ---
 
-## Authentication — OAuth Client Credentials Flow
+## Authentication — Dual Mode
 
-This server authenticates to Salesforce using **OAuth 2.0 Client Credentials Flow** (server-to-server, no user login required).
+`get_sf()` supports two auth modes depending on how the MCP connection was opened:
 
 ```python
-# server.py — get_sf() function
 def get_sf() -> Salesforce:
+    # Mode 1: per-user token injected via async context (from mcp-chat OAuth login)
+    creds = _current_sf_creds.get()
+    if creds and creds.get("token"):
+        return Salesforce(
+            instance_url=creds["instance_url"],
+            session_id=creds["token"],   # user's SF access token
+        )
+
+    # Mode 2: Client Credentials fallback (env vars — for CLI / direct use)
     resp = requests.post(
         f"{instance_url}/services/oauth2/token",
         data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
+            "grant_type":    "client_credentials",
+            "client_id":     client_id,
             "client_secret": client_secret,
         },
     )
     token = resp.json()
-    return Salesforce(
-        instance_url=token["instance_url"],
-        session_id=token["access_token"],
-    )
+    return Salesforce(instance_url=token["instance_url"], session_id=token["access_token"])
 ```
 
-Every tool call triggers a fresh OAuth token request. Salesforce responds with:
+| Mode | When used | How |
+|---|---|---|
+| Per-user token | Connecting via mcp-chat browser UI | User's SF token passed via `?sf_token=` on SSE URL |
+| Client Credentials | CLI / direct MCP client / testing | `SF_CLIENT_ID` + `SF_CLIENT_SECRET` in `.env` |
 
-```json
-{
-  "access_token": "00DgK00000MqZJZ!AQEAQIF5qpaQ_XZ...",
-  "instance_url": "https://orgfarm-xxx.my.salesforce.com",
-  "token_type": "Bearer",
-  "scope": "api",
-  "issued_at": "1775545150722"
-}
+---
+
+## Per-Session Token Injection
+
+When mcp-chat connects to this server, it appends the user's SF token to the SSE URL:
+
+```
+GET http://localhost:8000/sse?sf_token=00DgK...&sf_instance=https://orgfarm-xxx.my.salesforce.com
 ```
 
-The `access_token` is used as the session ID and the `instance_url` is used to construct all Salesforce REST API calls. No username or password is ever stored or transmitted.
+The server captures this token and stores it against the MCP session ID so `get_sf()` can use it when tools are called:
 
-**Salesforce setup required:**
-1. Create a Connected App in Setup → App Manager
-2. Enable OAuth → tick **Enable Client Credentials Flow**
-3. Add scopes: `api`, `full`
-4. Go to Manage → Edit Policies → set **Run As** user
-5. Set **Permitted Users** to "All users may self-authorize"
+### Step A — Capture session_id from SSE endpoint event
+
+The SSE transport assigns a `session_id` and sends it to the client in the first SSE event:
+```
+event: endpoint
+data: /messages/?session_id=f4f4738fc2b54cda98cc14faf55cef37
+```
+
+`handle_sse()` intercepts this event to capture the session_id and store the token:
+
+```python
+async def handle_sse(request: Request) -> None:
+    sf_token    = request.query_params.get("sf_token")
+    sf_instance = request.query_params.get("sf_instance")
+    session_id_holder = {}
+
+    async def capturing_send(message):
+        # Intercept the endpoint SSE event to get the session_id
+        if message["type"] == "http.response.body" and "id" not in session_id_holder:
+            body = message.get("body", b"").decode("utf-8", errors="ignore")
+            m = re.search(r"session_id=([^\s\"&\n]+)", body)
+            if m and sf_token:
+                sid = m.group(1)
+                session_id_holder["id"] = sid
+                _session_creds[sid] = {"token": sf_token, "instance_url": sf_instance}
+        await original_send(message)
+
+    async with sse_transport.connect_sse(request.scope, request.receive, capturing_send) as streams:
+        await server.run(streams[0], streams[1], ...)
+    # cleanup: _session_creds.pop(sid) when connection closes
+```
+
+### Step B — Inject token into async context on each tool call POST
+
+Tool calls arrive as `POST /messages/?session_id=<id>`. A wrapper around `handle_post_message` reads the session_id from the URL, looks up the token, and injects it into the async context before routing the request:
+
+```python
+async def handle_post_with_creds(scope, receive, send):
+    qs         = parse_qs(scope.get("query_string", b"").decode())
+    session_id = (qs.get("session_id") or [None])[0]
+    creds      = _session_creds.get(session_id)   # look up stored token
+
+    token = _current_sf_creds.set(creds)          # inject into async context
+    try:
+        await sse_transport.handle_post_message(scope, receive, send)
+    finally:
+        _current_sf_creds.reset(token)            # restore after request
+
+starlette_app = Starlette(
+    routes=[
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=handle_post_with_creds),   # ← uses wrapper
+    ]
+)
+```
+
+When `call_tool()` then calls `get_sf()`, the context var already holds the right token for that user's session.
+
+**Salesforce Connected App setup required:**
+1. **Setup → App Manager → New Connected App**
+2. Enable OAuth → tick **Authorization Code and Credentials Flow** (for browser login)
+3. Also tick **Enable Client Credentials Flow** (for CLI/direct use fallback)
+4. Add Callback URL: `http://localhost:3000/auth/salesforce/callback`
+5. Add scopes: `api`, `refresh_token`, `full`
+6. Uncheck **Require PKCE**
+7. Manage → Edit Policies → set **Run As** user (for Client Credentials fallback)
+8. Set **Permitted Users** to "All users may self-authorize"
 
 ---
 
